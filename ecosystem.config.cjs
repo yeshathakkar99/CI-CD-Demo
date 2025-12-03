@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "express-app",
+      name: "ci-cd-demo",
       script: "./dist/index.js", // TypeScript compiled output
       instances: "max",
       exec_mode: "cluster",
