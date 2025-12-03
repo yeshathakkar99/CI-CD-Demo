@@ -57,6 +57,7 @@ app.get("/quotes", (req: Request, res: Response) => {
       quote: quote,
       timestamp: new Date().toISOString(),
     });
+    console.log("data--->", data);
     res.write(`data: ${data}\n\n`);
   }, 3000);
 
