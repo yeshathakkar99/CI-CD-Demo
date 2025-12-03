@@ -1,20 +1,15 @@
-name: Build and Deploy to EC2
+name: Deploy to EC2
 
 on:
   push:
-    branches:
-      - main
-      - master
-  workflow_dispatch: # Allows manual triggering
-
-env:
-  NODE_VERSION: '20.x'
+    branches: [main]
+  workflow_dispatch: # manual trigger
 
 jobs:
-  build-and-deploy:
-    name: Build and Deploy
+  build:
+    name: Build Application
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,256 +17,177 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: "20.13.1"
+          cache: "npm"
 
       - name: Install dependencies
-        run: npm install
-        continue-on-error: false
+        run: npm i
 
-      - name: Run TypeScript type check
-        run: npx tsc --noEmit
-        continue-on-error: false
-
-      - name: Build project
+      - name: Build TypeScript
         run: npm run build
-        continue-on-error: false
 
-      - name: Verify build output
+      - name: Create deployment package (without node_modules)
         run: |
-          if [ ! -d "dist" ] || [ -z "$(ls -A dist)" ]; then
-            echo "Error: Build output directory 'dist' is empty or does not exist"
-            exit 1
-          fi
-          echo "Build verification successful"
-          ls -la dist/
+          mkdir -p deploy
+          cp -r dist deploy/
+          cp -r src deploy/
+          cp package*.json deploy/
+          cp ecosystem.config.cjs deploy/
+          # Copy .env.example if exists
+          [ -f .env.example ] && cp .env.example deploy/ || echo "No .env.example found"
+          tar -czf deploy.tar.gz -C deploy .
 
-      - name: Create deployment package
-        run: |
-          mkdir -p deploy-package
-          cp -r dist deploy-package/
-          cp package.json deploy-package/
-          cp package-lock.json deploy-package/
-          cp ecosystem.config.cjs deploy-package/
-          # Create .env file placeholder if it doesn't exist on server
-          echo "# Environment variables should be configured on the server" > deploy-package/.env.example
-          tar -czf deploy.tar.gz -C deploy-package .
-          echo "Deployment package created"
-
-      - name: Setup SSH
-        uses: webfactory/ssh-agent@v0.9.0
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          name: deployment-package
+          path: deploy.tar.gz
+          retention-days: 1
 
-      - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
-          chmod 600 ~/.ssh/known_hosts
-          echo "SSH configuration completed"
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
 
-      - name: Verify SSH key is loaded
-        run: |
-          echo "Checking SSH agent..."
-          ssh-add -l || echo "No keys in agent or agent not running"
-          echo "SSH_AUTH_SOCK: $SSH_AUTH_SOCK"
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
 
-      - name: Test SSH connection
-        run: |
-          echo "Testing SSH connection to ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}..."
-          ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'" || {
-            echo "SSH connection failed. Common issues:"
-            echo "1. Verify EC2_SSH_PRIVATE_KEY secret includes BEGIN/END markers"
-            echo "2. Verify EC2_HOST is correct (IP or domain)"
-            echo "3. Verify EC2_USER is correct (ubuntu/ec2-user/admin)"
-            echo "4. Verify public key is added to ~/.ssh/authorized_keys on EC2"
-            echo "5. Verify EC2 security group allows SSH from GitHub Actions IPs"
-            exit 1
-          }
-        continue-on-error: false
-
-      - name: Create deployment directory on EC2
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/var/www/ci-cd-demo}"
-            mkdir -p $DEPLOY_PATH
-            mkdir -p $DEPLOY_PATH/logs
-            mkdir -p $DEPLOY_PATH/backups
-            echo "Deployment directory created: $DEPLOY_PATH"
-          EOF
+      - name: Deploy to EC2 via SSH
         env:
-          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
-
-      - name: Backup current deployment
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/var/www/ci-cd-demo}"
-            BACKUP_DIR="$DEPLOY_PATH/backups/$(date +%Y%m%d_%H%M%S)"
-            if [ -d "$DEPLOY_PATH/dist" ]; then
-              mkdir -p $BACKUP_DIR
-              cp -r $DEPLOY_PATH/dist $BACKUP_DIR/ 2>/dev/null || true
-              cp $DEPLOY_PATH/package.json $BACKUP_DIR/ 2>/dev/null || true
-              cp $DEPLOY_PATH/ecosystem.config.cjs $BACKUP_DIR/ 2>/dev/null || true
-              echo "Backup created at: $BACKUP_DIR"
-              # Keep only last 5 backups
-              ls -t $DEPLOY_PATH/backups | tail -n +6 | xargs -r rm -rf
-            else
-              echo "No existing deployment to backup"
-            fi
-          EOF
-        env:
-          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
-        continue-on-error: true
-
-      - name: Transfer files to EC2
-        run: |
-          scp -o StrictHostKeyChecking=no deploy.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/deploy.tar.gz
-          echo "Files transferred successfully"
-
-      - name: Extract and deploy on EC2
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            set -e
-            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/var/www/ci-cd-demo}"
-            
-            echo "Preserving existing .env file if it exists..."
-            if [ -f "$DEPLOY_PATH/.env" ]; then
-              cp $DEPLOY_PATH/.env /tmp/.env.backup
-              echo ".env file backed up"
-            fi
-            
-            echo "Cleaning up old deployment files to ensure fresh deployment..."
-            cd $DEPLOY_PATH
-            # Remove old dist directory to force fresh extraction
-            rm -rf dist
-            # Remove old package files (will be replaced by new ones)
-            rm -f package.json package-lock.json ecosystem.config.cjs
-            echo "Old files cleaned up"
-            
-            echo "Extracting deployment package..."
-            tar -xzf /tmp/deploy.tar.gz
-            
-            echo "Verifying deployment files..."
-            if [ ! -d "$DEPLOY_PATH/dist" ] || [ ! -f "$DEPLOY_PATH/dist/index.js" ]; then
-              echo "ERROR: dist/index.js not found after extraction!"
-              exit 1
-            fi
-            echo "✓ Deployment files verified"
-            
-            echo "Restoring .env file if it was backed up..."
-            if [ -f "/tmp/.env.backup" ]; then
-              mv /tmp/.env.backup $DEPLOY_PATH/.env
-              echo ".env file restored"
-            fi
-            
-            echo "Installing production dependencies..."
-            npm install --production --no-audit --no-fund
-            
-            echo "Cleaning up temporary files..."
-            rm -f /tmp/deploy.tar.gz
-            
-            echo "Deployment files extracted successfully"
-          EOF
-        env:
-          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
-
-      - name: Verify Node.js and PM2 on EC2
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            echo "Checking Node.js version..."
-            node --version || (echo "Node.js not found. Please install Node.js." && exit 1)
-            
-            echo "Checking PM2 installation..."
-            if ! command -v pm2 &> /dev/null; then
-              echo "PM2 not found. Installing PM2 globally..."
-              npm install -g pm2
-            fi
-            pm2 --version
-          EOF
-
-      - name: Restart application with PM2
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            set -e
-            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/var/www/ci-cd-demo}"
-            cd $DEPLOY_PATH
-            
-            echo "Stopping and removing existing PM2 process..."
-            # Force stop and delete to ensure clean restart
-            pm2 stop ci-cd-demo 2>/dev/null || true
-            pm2 delete ci-cd-demo 2>/dev/null || true
-            # Wait a moment to ensure process is fully stopped
-            sleep 2
-            
-            echo "Verifying dist/index.js exists before starting PM2..."
-            if [ ! -f "$DEPLOY_PATH/dist/index.js" ]; then
-              echo "ERROR: dist/index.js not found! Cannot start application."
-              exit 1
-            fi
-            
-            echo "Starting application with PM2..."
-            pm2 start ecosystem.config.cjs
-            
-            echo "Waiting for PM2 to initialize..."
-            sleep 3
-            
-            echo "Saving PM2 process list..."
-            pm2 save
-            
-            echo "Setting PM2 to start on system boot..."
-            pm2 startup systemd -u $USER --hp /home/$USER || true
-            
-            echo "Application restarted successfully"
-            pm2 list
-            echo "Recent PM2 logs:"
-            pm2 logs ci-cd-demo --lines 20 --nostream
-          EOF
-        env:
-          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
-
-      - name: Health check
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/var/www/ci-cd-demo}"
-            PORT="${PORT:-7000}"
-            HOST="${EC2_HOST:-localhost}"
-            
-            echo "Waiting for application to start..."
-            sleep 5
-            
-            echo "Checking application status..."
-            pm2 status ci-cd-demo
-            
-            echo "Checking if application is responding..."
-            # Health check - adjust URL based on your setup
-            if curl -f http://localhost:$PORT/ > /dev/null 2>&1; then
-              echo "✓ Health check passed - Application is responding"
-            else
-              echo "⚠ Health check failed - Application may not be responding on port $PORT"
-              echo "Checking PM2 logs..."
-              pm2 logs ci-cd-demo --lines 50 --nostream
-              exit 1
-            fi
-          EOF
-        env:
-          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
-          PORT: ${{ secrets.PORT }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
-        continue-on-error: true
-
-      - name: Deployment summary
-        if: always()
+          EC2_USER: ${{ secrets.EC2_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
         run: |
-          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Time**: $(date)" >> $GITHUB_STEP_SUMMARY
+          # Create SSH key file
+          echo "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
 
-      - name: Cleanup local files
-        if: always()
+          # Copy deployment package to EC2
+          scp -i private_key.pem -o StrictHostKeyChecking=no \
+            deploy.tar.gz ${EC2_USER}@${EC2_HOST}:/tmp/
+
+          # SSH into EC2 and deploy
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USER}@${EC2_HOST} << 'EOF'
+            
+            # Navigate to app directory
+            cd /var/www/ci-cd-demo
+
+            # Fix ownership first (important!)
+            echo "Fixing directory ownership..."
+            sudo chown -R $USER:$USER /var/www/ci-cd-demo
+            
+            
+            # Backup current version
+            if [ -d "dist" ]; then
+              timestamp=$(date +%Y%m%d_%H%M%S)
+              mkdir -p backups
+              tar -czf backups/backup_${timestamp}.tar.gz dist package.json ecosystem.config.cjs .env 2>/dev/null || true
+              # Keep only last 5 backups
+              ls -t backups/backup_*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm
+            fi
+            
+            # Extract new version (this will overwrite existing files)
+            echo "Extracting new deployment package..."
+            tar --overwrite -xzf /tmp/deploy.tar.gz -C /var/www/ci-cd-demo
+            rm /tmp/deploy.tar.gz
+
+            # Fix ownership after extraction
+            sudo chown -R $USER:$USER /var/www/ci-cd-demo
+            
+            
+            # Install production dependencies on the server
+            echo ""
+            echo "Installing production dependencies..."
+            npm ci
+            
+            # Create .env file if needed (only on first deploy)
+            if [ ! -f .env ]; then
+              echo "Creating default .env file..."
+              echo "NODE_ENV=production" > .env
+              echo "PORT=7000" >> .env
+            fi
+            
+            # Create logs directory
+            mkdir -p logs
+            
+            # Zero-downtime reload with PM2
+            if pm2 describe ci-cd-demo > /dev/null 2>&1; then
+              echo "Reloading PM2 app (zero-downtime)..."
+              sudo pm2 reload ecosystem.config.cjs --update-env
+            else
+              echo "Starting new PM2 process..."
+              sudo pm2 start ecosystem.config.cjs
+            fi
+            
+            # Save PM2 process list
+            sudo pm2 save
+           
+          EOF
+
+          # Cleanup
+          rm private_key.pem
+
+      - name: Verify deployment
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          rm -rf deploy-package deploy.tar.gz
-          echo "Local cleanup completed"
+          echo "Waiting for application to start..."
+          sleep 10
 
+          # Check if app responds via nginx (try multiple times)
+          for i in {1..2}; do
+            echo "Attempt $i of 2..."
+            response=$(curl -s -o /dev/null -w "%{http_code}" http://${EC2_HOST} 2>/dev/null || echo "000")
+            
+            if [ "$response" = "200" ] || [ "$response" = "301" ] || [ "$response" = "302" ]; then
+              echo "✅ Deployment successful! App is responding with status: $response"
+              exit 0
+            fi
+            
+            echo "Got response: $response, waiting 5 seconds..."
+            sleep 5
+          done
+
+          echo "❌ Deployment verification failed after 2 attempts"
+          echo "Please check PM2 logs on the server"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          echo "🔄 Attempting to rollback to previous version..."
+
+          echo "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
+
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USER}@${EC2_HOST} << 'EOF'
+            
+            cd /var/www/ci-cd-demo
+
+            # Fix ownership first (important!)
+            sudo chown -R $USER:$USER /var/www/ci-cd-demo
+            
+            # Find latest backup
+            latest_backup=$(ls -t backups/backup_*.tar.gz 2>/dev/null | head -1)
+            
+            if [ -n "$latest_backup" ]; then
+              echo "Found backup: $latest_backup"
+              tar -xzf "$latest_backup" -C /var/www/ci-cd-demo
+              npm ci
+              pm2 reload ecosystem.config.cjs
+              echo "✅ Rolled back to previous version"
+            else
+              echo "⚠️ No backup found, cannot rollback"
+            fi
+          EOF
+
+          rm private_key.pem
