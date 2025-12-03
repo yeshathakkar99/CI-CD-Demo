@@ -1,0 +1,233 @@
+name: Build and Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch: # Allows manual triggering
+
+env:
+  NODE_VERSION: '20.x'
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        continue-on-error: false
+
+      - name: Run TypeScript type check
+        run: npx tsc --noEmit
+        continue-on-error: false
+
+      - name: Build project
+        run: npm run build
+        continue-on-error: false
+
+      - name: Verify build output
+        run: |
+          if [ ! -d "dist" ] || [ -z "$(ls -A dist)" ]; then
+            echo "Error: Build output directory 'dist' is empty or does not exist"
+            exit 1
+          fi
+          echo "Build verification successful"
+          ls -la dist/
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy-package
+          cp -r dist deploy-package/
+          cp package.json deploy-package/
+          cp package-lock.json deploy-package/
+          cp ecosystem.config.cjs deploy-package/
+          # Create .env file placeholder if it doesn't exist on server
+          echo "# Environment variables should be configured on the server" > deploy-package/.env.example
+          tar -czf deploy.tar.gz -C deploy-package .
+          echo "Deployment package created"
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+      - name: Add EC2 to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'"
+        continue-on-error: false
+
+      - name: Create deployment directory on EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/home/$USER/app}"
+            mkdir -p $DEPLOY_PATH
+            mkdir -p $DEPLOY_PATH/logs
+            mkdir -p $DEPLOY_PATH/backups
+            echo "Deployment directory created: $DEPLOY_PATH"
+          EOF
+        env:
+          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
+
+      - name: Backup current deployment
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/home/$USER/app}"
+            BACKUP_DIR="$DEPLOY_PATH/backups/$(date +%Y%m%d_%H%M%S)"
+            if [ -d "$DEPLOY_PATH/dist" ]; then
+              mkdir -p $BACKUP_DIR
+              cp -r $DEPLOY_PATH/dist $BACKUP_DIR/ 2>/dev/null || true
+              cp $DEPLOY_PATH/package.json $BACKUP_DIR/ 2>/dev/null || true
+              cp $DEPLOY_PATH/ecosystem.config.cjs $BACKUP_DIR/ 2>/dev/null || true
+              echo "Backup created at: $BACKUP_DIR"
+              # Keep only last 5 backups
+              ls -t $DEPLOY_PATH/backups | tail -n +6 | xargs -r rm -rf
+            else
+              echo "No existing deployment to backup"
+            fi
+          EOF
+        env:
+          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
+        continue-on-error: true
+
+      - name: Transfer files to EC2
+        run: |
+          scp -o StrictHostKeyChecking=no deploy.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/deploy.tar.gz
+          echo "Files transferred successfully"
+
+      - name: Extract and deploy on EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -e
+            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/home/$USER/app}"
+            
+            echo "Preserving existing .env file if it exists..."
+            if [ -f "$DEPLOY_PATH/.env" ]; then
+              cp $DEPLOY_PATH/.env /tmp/.env.backup
+              echo ".env file backed up"
+            fi
+            
+            echo "Extracting deployment package..."
+            cd $DEPLOY_PATH
+            tar -xzf /tmp/deploy.tar.gz
+            
+            echo "Restoring .env file if it was backed up..."
+            if [ -f "/tmp/.env.backup" ]; then
+              mv /tmp/.env.backup $DEPLOY_PATH/.env
+              echo ".env file restored"
+            fi
+            
+            echo "Installing production dependencies..."
+            npm ci --production --no-audit --no-fund
+            
+            echo "Cleaning up temporary files..."
+            rm -f /tmp/deploy.tar.gz
+            
+            echo "Deployment files extracted successfully"
+          EOF
+        env:
+          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
+
+      - name: Verify Node.js and PM2 on EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            echo "Checking Node.js version..."
+            node --version || (echo "Node.js not found. Please install Node.js." && exit 1)
+            
+            echo "Checking PM2 installation..."
+            if ! command -v pm2 &> /dev/null; then
+              echo "PM2 not found. Installing PM2 globally..."
+              npm install -g pm2
+            fi
+            pm2 --version
+          EOF
+
+      - name: Restart application with PM2
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -e
+            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/home/$USER/app}"
+            cd $DEPLOY_PATH
+            
+            echo "Stopping existing PM2 process if running..."
+            pm2 stop express-app || pm2 delete express-app || true
+            
+            echo "Starting application with PM2..."
+            pm2 start ecosystem.config.cjs
+            
+            echo "Saving PM2 process list..."
+            pm2 save
+            
+            echo "Setting PM2 to start on system boot..."
+            pm2 startup systemd -u $USER --hp /home/$USER || true
+            
+            echo "Application restarted successfully"
+            pm2 list
+            pm2 logs express-app --lines 20 --nostream
+          EOF
+        env:
+          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
+
+      - name: Health check
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            DEPLOY_PATH="${EC2_DEPLOY_PATH:-/home/$USER/app}"
+            PORT="${PORT:-7000}"
+            HOST="${EC2_HOST:-localhost}"
+            
+            echo "Waiting for application to start..."
+            sleep 5
+            
+            echo "Checking application status..."
+            pm2 status express-app
+            
+            echo "Checking if application is responding..."
+            # Health check - adjust URL based on your setup
+            if curl -f http://localhost:$PORT/ > /dev/null 2>&1; then
+              echo "✓ Health check passed - Application is responding"
+            else
+              echo "⚠ Health check failed - Application may not be responding on port $PORT"
+              echo "Checking PM2 logs..."
+              pm2 logs express-app --lines 50 --nostream
+              exit 1
+            fi
+          EOF
+        env:
+          EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
+          PORT: ${{ secrets.PORT }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        continue-on-error: true
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup local files
+        if: always()
+        run: |
+          rm -rf deploy-package deploy.tar.gz
+          echo "Local cleanup completed"
+
