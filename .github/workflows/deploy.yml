@@ -140,9 +140,23 @@ jobs:
               echo ".env file backed up"
             fi
             
-            echo "Extracting deployment package..."
+            echo "Cleaning up old deployment files to ensure fresh deployment..."
             cd $DEPLOY_PATH
+            # Remove old dist directory to force fresh extraction
+            rm -rf dist
+            # Remove old package files (will be replaced by new ones)
+            rm -f package.json package-lock.json ecosystem.config.cjs
+            echo "Old files cleaned up"
+            
+            echo "Extracting deployment package..."
             tar -xzf /tmp/deploy.tar.gz
+            
+            echo "Verifying deployment files..."
+            if [ ! -d "$DEPLOY_PATH/dist" ] || [ ! -f "$DEPLOY_PATH/dist/index.js" ]; then
+              echo "ERROR: dist/index.js not found after extraction!"
+              exit 1
+            fi
+            echo "✓ Deployment files verified"
             
             echo "Restoring .env file if it was backed up..."
             if [ -f "/tmp/.env.backup" ]; then
@@ -182,11 +196,24 @@ jobs:
             DEPLOY_PATH="${EC2_DEPLOY_PATH:-/var/www/ci-cd-demo}"
             cd $DEPLOY_PATH
             
-            echo "Stopping existing PM2 process if running..."
-            pm2 stop ci-cd-demo || pm2 delete ci-cd-demo || true
+            echo "Stopping and removing existing PM2 process..."
+            # Force stop and delete to ensure clean restart
+            pm2 stop ci-cd-demo 2>/dev/null || true
+            pm2 delete ci-cd-demo 2>/dev/null || true
+            # Wait a moment to ensure process is fully stopped
+            sleep 2
+            
+            echo "Verifying dist/index.js exists before starting PM2..."
+            if [ ! -f "$DEPLOY_PATH/dist/index.js" ]; then
+              echo "ERROR: dist/index.js not found! Cannot start application."
+              exit 1
+            fi
             
             echo "Starting application with PM2..."
             pm2 start ecosystem.config.cjs
+            
+            echo "Waiting for PM2 to initialize..."
+            sleep 3
             
             echo "Saving PM2 process list..."
             pm2 save
@@ -196,6 +223,7 @@ jobs:
             
             echo "Application restarted successfully"
             pm2 list
+            echo "Recent PM2 logs:"
             pm2 logs ci-cd-demo --lines 20 --nostream
           EOF
         env:
