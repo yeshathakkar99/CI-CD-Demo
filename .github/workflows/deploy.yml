@@ -25,7 +25,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
         continue-on-error: false
 
       - name: Run TypeScript type check
@@ -134,7 +134,7 @@ jobs:
             fi
             
             echo "Installing production dependencies..."
-            npm ci --production --no-audit --no-fund
+            npm install --production --no-audit --no-fund
             
             echo "Cleaning up temporary files..."
             rm -f /tmp/deploy.tar.gz
