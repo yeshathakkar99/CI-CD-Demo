@@ -62,15 +62,32 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
 
-      - name: Add EC2 to known hosts
+      - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          chmod 700 ~/.ssh
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
           chmod 600 ~/.ssh/known_hosts
+          echo "SSH configuration completed"
+
+      - name: Verify SSH key is loaded
+        run: |
+          echo "Checking SSH agent..."
+          ssh-add -l || echo "No keys in agent or agent not running"
+          echo "SSH_AUTH_SOCK: $SSH_AUTH_SOCK"
 
       - name: Test SSH connection
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'"
+          echo "Testing SSH connection to ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}..."
+          ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'" || {
+            echo "SSH connection failed. Common issues:"
+            echo "1. Verify EC2_SSH_PRIVATE_KEY secret includes BEGIN/END markers"
+            echo "2. Verify EC2_HOST is correct (IP or domain)"
+            echo "3. Verify EC2_USER is correct (ubuntu/ec2-user/admin)"
+            echo "4. Verify public key is added to ~/.ssh/authorized_keys on EC2"
+            echo "5. Verify EC2 security group allows SSH from GitHub Actions IPs"
+            exit 1
+          }
         continue-on-error: false
 
       - name: Create deployment directory on EC2

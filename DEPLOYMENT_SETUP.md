@@ -135,11 +135,66 @@ NODE_ENV=production
 
 ## Troubleshooting
 
-### SSH Connection Fails
-- Verify `EC2_SSH_PRIVATE_KEY` is correctly formatted (include headers/footers)
-- Check `EC2_HOST` and `EC2_USER` are correct
-- Ensure EC2 security group allows SSH from GitHub Actions IPs
-- Verify SSH key is added to `~/.ssh/authorized_keys` on EC2
+### SSH Connection Fails - "Permission denied (publickey)"
+
+This is the most common issue. Follow these steps:
+
+1. **Verify SSH Key Format in GitHub Secrets**
+   - The `EC2_SSH_PRIVATE_KEY` must include the complete key with headers:
+   ```
+   -----BEGIN RSA PRIVATE KEY-----
+   (key content here)
+   -----END RSA PRIVATE KEY-----
+   ```
+   - Or for newer keys:
+   ```
+   -----BEGIN OPENSSH PRIVATE KEY-----
+   (key content here)
+   -----END OPENSSH PRIVATE KEY-----
+   ```
+   - **Common mistake**: Missing the BEGIN/END lines or extra whitespace
+   - To copy correctly: `cat ~/.ssh/github_actions_deploy` and copy ALL output
+
+2. **Verify Public Key is on EC2 Server**
+   ```bash
+   # SSH into EC2 manually
+   ssh your-user@your-ec2-ip
+   
+   # Check authorized_keys file
+   cat ~/.ssh/authorized_keys
+   
+   # Should contain your public key (the .pub file content)
+   # If missing, add it:
+   echo "your-public-key-content" >> ~/.ssh/authorized_keys
+   chmod 600 ~/.ssh/authorized_keys
+   ```
+
+3. **Verify EC2 Security Group**
+   - AWS Console → EC2 → Security Groups
+   - Inbound rules must allow SSH (port 22) from:
+     - Your IP address, OR
+     - `0.0.0.0/0` (not recommended for production), OR
+     - GitHub Actions IP ranges (check GitHub's API for current IPs)
+
+4. **Verify EC2_HOST and EC2_USER**
+   - `EC2_HOST`: Use public IP or public DNS name (not private IP)
+   - `EC2_USER`: 
+     - Ubuntu: `ubuntu`
+     - Amazon Linux: `ec2-user`
+     - Debian: `admin` or `debian`
+     - Check your AMI documentation
+
+5. **Test SSH Connection Locally First**
+   ```bash
+   # Test with the same key GitHub Actions will use
+   ssh -i ~/.ssh/github_actions_deploy your-user@your-ec2-ip
+   ```
+   If this fails, fix it before expecting GitHub Actions to work.
+
+6. **Check EC2 Instance Status**
+   - Ensure instance is running
+   - Check system logs for any issues
+   - Verify network connectivity
 
 ### Build Fails
 - Check Node.js version compatibility
