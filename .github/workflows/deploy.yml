@@ -183,7 +183,7 @@ jobs:
             cd $DEPLOY_PATH
             
             echo "Stopping existing PM2 process if running..."
-            pm2 stop express-app || pm2 delete express-app || true
+            pm2 stop ci-cd-demo || pm2 delete ci-cd-demo || true
             
             echo "Starting application with PM2..."
             pm2 start ecosystem.config.cjs
@@ -196,7 +196,7 @@ jobs:
             
             echo "Application restarted successfully"
             pm2 list
-            pm2 logs express-app --lines 20 --nostream
+            pm2 logs ci-cd-demo --lines 20 --nostream
           EOF
         env:
           EC2_DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
@@ -212,7 +212,7 @@ jobs:
             sleep 5
             
             echo "Checking application status..."
-            pm2 status express-app
+            pm2 status ci-cd-demo
             
             echo "Checking if application is responding..."
             # Health check - adjust URL based on your setup
@@ -221,7 +221,7 @@ jobs:
             else
               echo "⚠ Health check failed - Application may not be responding on port $PORT"
               echo "Checking PM2 logs..."
-              pm2 logs express-app --lines 50 --nostream
+              pm2 logs ci-cd-demo --lines 50 --nostream
               exit 1
             fi
           EOF
